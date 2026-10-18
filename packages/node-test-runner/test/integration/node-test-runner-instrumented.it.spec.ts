@@ -368,3 +368,55 @@ describe('node-test-runner running TypeScript through type stripping', () => {
     expect(run.killedBy).deep.eq([addId]);
   });
 });
+
+describe('Running a file that throws as it loads', () => {
+  let sandbox: TempTestDirectorySandbox;
+  const tests = [
+    toTestId('tests/parts.spec.mjs', 'the first part is a'),
+    toTestId('tests/parts.spec.mjs', 'there are two parts'),
+  ];
+  const runner = async () => {
+    (testInjector.options as NodeTestRunnerOptionsWithStrykerOptions).nodeTest =
+      nodeTestRunnerOptions({ testFiles: ['tests/**/*.spec.mjs'] });
+    const sut = testInjector.injector.injectFunction(
+      createNodeTestRunnerFactory('__stryker2__'),
+    );
+    await sut.init();
+    return sut;
+  };
+  // Mutant '0' makes `parts` null, so tests/parts.spec.mjs throws before declaring a test
+  const killFileAtLoad = (sut: NodeTestRunner) =>
+    sut.mutantRun(
+      factory.mutantRunOptions({
+        activeMutant: factory.mutant({ id: '0' }),
+        mutantActivation: 'static',
+      }),
+    );
+
+  beforeEach(async () => {
+    sandbox = new TempTestDirectorySandbox('load-throw-instrumented');
+    await sandbox.init();
+  });
+  afterEach(async () => {
+    await sandbox.dispose();
+  });
+
+  it("should report the file's tests as its killers, as the dry run named them", async () => {
+    const sut = await runner();
+    const dryRun = await sut.dryRun(factory.dryRunOptions());
+    assertions.expectCompleted(dryRun);
+    expect(dryRun.tests.map((t) => t.id)).deep.eq(tests);
+
+    const run = await killFileAtLoad(sut);
+
+    assertions.expectKilled(run);
+    expect(run.killedBy).deep.eq(tests);
+  });
+
+  it("should find the file's tests in a worker that didn't do the dry run", async () => {
+    const run = await killFileAtLoad(await runner());
+
+    assertions.expectKilled(run);
+    expect(run.killedBy).deep.eq(tests);
+  });
+});

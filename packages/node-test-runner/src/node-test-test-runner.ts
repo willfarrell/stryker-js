@@ -33,7 +33,7 @@ import { glob } from 'glob';
 
 import * as pluginTokens from './plugin-tokens.js';
 import { NodeTestRunnerOptionsWithStrykerOptions } from './node-test-runner-options-with-stryker-options.js';
-import { fileOfTestId } from './test-id.js';
+import { fileOfTestId, nameOfTestId } from './test-id.js';
 import { isSupportedNodeVersion, MIN_NODE_VERSION } from './node-version.js';
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -129,6 +129,9 @@ export class NodeTestRunner implements TestRunner {
 
   private readonly options: NodeTestRunnerOptionsWithStrykerOptions;
   private testFiles: string[] = [];
+  // Each file's test ids, so a mutant that makes a file throw as it loads is killed by that
+  // file's tests (ids in the report) rather than by a placeholder named after the file
+  private readonly testIdsByFile = new Map<string, string[]>();
 
   constructor(
     options: StrykerOptions,
@@ -179,6 +182,7 @@ export class NodeTestRunner implements TestRunner {
       options.timeout,
       false, // never bail on a dry run — we need every test and its coverage
     );
+    if (result.status === DryRunStatus.Complete) this.remember(result.tests);
     if (result.status !== DryRunStatus.Complete || !result.mutantCoverage) {
       return result;
     }
@@ -237,7 +241,11 @@ export class NodeTestRunner implements TestRunner {
       return { status: DryRunStatus.Timeout, reason: 'Test run timed out' };
     }
 
-    const tests = this.toTestResults(outcome.tests);
+    const reported = this.toTestResults(outcome.tests);
+    const tests =
+      spec.activeMutant === undefined
+        ? reported
+        : await this.withFileTests(reported, spec.testFiles, timeout);
 
     if (
       spec.activeMutant !== undefined &&
@@ -276,6 +284,55 @@ export class NodeTestRunner implements TestRunner {
       tests,
       mutantCoverage: outcome.coverage,
     };
+  }
+
+  private remember(tests: TestResult[]) {
+    const byFile = new Map<string, string[]>();
+    for (const { id } of tests) {
+      const file = fileOfTestId(id);
+      if (file === id) continue; // a load failure's placeholder, not a test
+      byFile.set(file, [...(byFile.get(file) ?? []), id]);
+    }
+    byFile.forEach((ids, file) => this.testIdsByFile.set(file, ids));
+  }
+
+  /**
+   * A file that failed to load is reported as one placeholder test named after the file.
+   * Replace it with the file's own tests, known from this worker's dry run or, in a worker
+   * that didn't do it, from one run of the file without the mutant.
+   */
+  private async withFileTests(
+    tests: TestResult[],
+    testFiles: string[],
+    timeout: number,
+  ): Promise<TestResult[]> {
+    const resolved: TestResult[] = [];
+    for (const test of tests) {
+      if (test.status !== TestStatus.Failed || !testFiles.includes(test.id)) {
+        resolved.push(test);
+        continue;
+      }
+      const ids =
+        this.testIdsByFile.get(test.id) ??
+        (await this.listTests(test.id, timeout));
+      resolved.push(
+        ...(ids.length
+          ? ids.map((id) => ({ ...test, id, name: nameOfTestId(id) }))
+          : [test]),
+      );
+    }
+    return resolved;
+  }
+
+  private async listTests(file: string, timeout: number): Promise<string[]> {
+    const outcome = await this.runInChild(
+      { testFiles: [file], collectCoverage: false, concurrency: false },
+      timeout,
+      false,
+    );
+    const ids = outcome.tests.map((t) => t.id).filter((id) => id !== file);
+    this.testIdsByFile.set(file, ids);
+    return ids;
   }
 
   /** Map the child's reported tests into Stryker's {@link TestResult} shape. */
